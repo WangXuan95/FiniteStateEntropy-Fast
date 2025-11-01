@@ -36,7 +36,7 @@ endif
 
 DESTDIR   ?=
 CPPFLAGS  += -I$(FSEDIR)
-CFLAGS    ?= -O3 $(ALIGN_LOOP)
+CFLAGS    ?= -O3 -mavx2 $(ALIGN_LOOP)
 CFLAGS    += -Wall -Wextra -Wcast-qual -Wcast-align -Wshadow \
              -Wstrict-aliasing=1 -Wswitch-enum -Wstrict-prototypes -Wundef
 FLAGS      = $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(MOREFLAGS)

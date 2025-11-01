@@ -25,6 +25,8 @@
 #include "fse.h"
 #include "error_private.h"
 
+#include <immintrin.h>  // AVX2
+
 
 /* **************************************************************
 *  Error Management
@@ -238,17 +240,97 @@ FORCE_INLINE_TEMPLATE size_t FSE_decompress_usingDTable_generic(
 }
 
 
+FORCE_INLINE_TEMPLATE size_t FSE_decompress_stream8_interleave2_AVX2 (uint8_t* dst, size_t dstSize, const uint8_t* src, size_t srcSize, const FSE_DTable* dt) {
+    U16 tl =  ((const FSE_DTableHeader*)dt)->tableLog;
+    const FSE_decode_t* dtable = ((const FSE_decode_t*)(dt+1));
+
+    uint8_t* op = dst;
+    uint8_t* const omax = op + dstSize;
+    
+    size_t size_rem = *(src++);
+    if (size_rem > 0) {
+        memcpy(op, src, size_rem);
+        src += size_rem;
+        op  += size_rem;
+    }
+
+    uint32_t *p_len = (uint32_t*)src;
+    if (p_len[0] > 0) {
+        uint8_t *ip0 = (uint8_t*)(&(p_len[8])) + p_len[0] - 4;    // 一次加载一个 uint32_t , 因此这里是 - 4
+        uint8_t *ip1 = ip0                     + p_len[1];
+        uint8_t *ip2 = ip1                     + p_len[2];
+        uint8_t *ip3 = ip2                     + p_len[3];
+        uint8_t *ip4 = ip3                     + p_len[4];
+        uint8_t *ip5 = ip4                     + p_len[5];
+        uint8_t *ip6 = ip5                     + p_len[6];
+        uint8_t *ip7 = ip6                     + p_len[7];
+
+        __m256i v8_ip = _mm256_set_epi32((ip7-src), (ip6-src), (ip5-src), (ip4-src), (ip3-src), (ip2-src), (ip1-src), (ip0-src));
+        __m256i v8_c  = _mm256_setr_epi32(
+            ip0[3] ? (8 - BIT_highbit32(ip0[3])) : 0,
+            ip1[3] ? (8 - BIT_highbit32(ip1[3])) : 0,
+            ip2[3] ? (8 - BIT_highbit32(ip2[3])) : 0,
+            ip3[3] ? (8 - BIT_highbit32(ip3[3])) : 0,
+            ip4[3] ? (8 - BIT_highbit32(ip4[3])) : 0,
+            ip5[3] ? (8 - BIT_highbit32(ip5[3])) : 0,
+            ip6[3] ? (8 - BIT_highbit32(ip6[3])) : 0,
+            ip7[3] ? (8 - BIT_highbit32(ip7[3])) : 0 );
+        __m256i v8_d  = _mm256_i32gather_epi32((int*)src, v8_ip, 1);
+        __m256i v8_sl = _mm256_srlv_epi32(_mm256_sllv_epi32(v8_d,                  v8_c                        ), _mm256_set1_epi32(32-tl));
+        __m256i v8_sh = _mm256_srlv_epi32(_mm256_sllv_epi32(v8_d, _mm256_add_epi32(v8_c, _mm256_set1_epi32(tl))), _mm256_set1_epi32(32-tl));
+        v8_c = _mm256_add_epi32(v8_c, _mm256_set1_epi32(tl*2));
+
+        __m256i v8_7  = _mm256_set1_epi32(7);
+        __m256i v8_32 = _mm256_set1_epi32(32);
+        __m256i v8_FFFF = _mm256_set1_epi32(0xFFFF);
+        __m256i v16_FF = _mm256_set1_epi16(0xFF);
+
+        for (; op<omax; op+=16) {
+            __m256i v8_ol, v8_oh, v16_o, v8_nbl, v8_nbh;
+
+            // reload ---------------------------------------------------------------------------------------------------------------
+            v8_ip = _mm256_sub_epi32(v8_ip, _mm256_srli_epi32(v8_c, 3));
+            v8_c  = _mm256_and_si256(v8_c, v8_7);
+            v8_d  = _mm256_i32gather_epi32((int*)src, v8_ip, 1);
+            v8_d  = _mm256_sllv_epi32(v8_d, v8_c);
+            
+            // decode 16 bytes ---------------------------------------------------------------------------------------------------------------
+            v8_ol = _mm256_i32gather_epi32((int*)dtable, v8_sl, 4);            // ol = dtable[sl]      {8-bit nbBits, 8-bit symbol, 16-bit newState}
+            v8_oh = _mm256_i32gather_epi32((int*)dtable, v8_sh, 4);            // oh = dtable[sh]      {8-bit nbBits, 8-bit symbol, 16-bit newState}
+            v8_nbl= _mm256_srli_epi32(v8_ol, 24);                              // nbl= (ol>>24)
+            v8_nbh= _mm256_srli_epi32(v8_oh, 24);                              // nbh= (oh>>24)
+            v8_sl = _mm256_srlv_epi32(v8_d, _mm256_sub_epi32(v8_32, v8_nbl));  // sl = d>>(32-nbl)
+            v8_sl = _mm256_add_epi32(v8_sl, _mm256_and_si256(v8_ol, v8_FFFF)); // sl+= ol&0xFFFF
+            v8_sh = _mm256_srlv_epi32(_mm256_sllv_epi32(v8_d, v8_nbl), _mm256_sub_epi32(v8_32, v8_nbh));  // sl = (d<<nbl)>>(32-nbh)
+            v8_sh = _mm256_add_epi32(v8_sh, _mm256_and_si256(v8_oh, v8_FFFF)); // sh+= oh&0xFFFF
+            v8_c  = _mm256_add_epi32(v8_c, _mm256_add_epi32(v8_nbl, v8_nbh));  // c += nb
+            v8_ol = _mm256_srli_epi32(v8_ol, 16);
+            v8_oh = _mm256_srli_epi32(v8_oh, 16);
+            v16_o = _mm256_permute4x64_epi64(_mm256_packus_epi32(v8_ol, v8_oh), _MM_SHUFFLE(3, 1, 2, 0));
+            v16_o = _mm256_and_si256(v16_o, v16_FF);
+            v16_o = _mm256_permute4x64_epi64(_mm256_packus_epi16(v16_o, v16_o), _MM_SHUFFLE(3, 1, 2, 0));
+            _mm_storeu_si128((__m128i*)op, _mm256_castsi256_si128(v16_o));
+        }
+    }
+
+    return op - (uint8_t*)dst;
+}
+
+
 size_t FSE_decompress_usingDTable(void* dst, size_t originalSize,
                             const void* cSrc, size_t cSrcSize,
                             const FSE_DTable* dt)
 {
+#ifdef __AVX2__
+    return FSE_decompress_stream8_interleave2_AVX2(dst, originalSize, cSrc, cSrcSize, dt);
+#else
     const void* ptr = dt;
     const FSE_DTableHeader* DTableH = (const FSE_DTableHeader*)ptr;
     const U32 fastMode = DTableH->fastMode;
-
     /* select fast mode (static) */
     if (fastMode) return FSE_decompress_usingDTable_generic(dst, originalSize, cSrc, cSrcSize, dt, 1);
     return FSE_decompress_usingDTable_generic(dst, originalSize, cSrc, cSrcSize, dt, 0);
+#endif
 }
 
 

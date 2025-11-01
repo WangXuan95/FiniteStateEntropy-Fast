@@ -610,16 +610,81 @@ static size_t FSE_compress_usingCTable_generic (void* dst, size_t dstSize,
     return BIT_closeCStream(&bitC);
 }
 
+
+
+static size_t FSE_compress_interleave2 (void* dst, size_t dstSize, const uint8_t* src, size_t loop_times, size_t step, const FSE_CTable* ct) {
+    BIT_CStream_t bitC;
+    FSE_CState_t  s0, s1;
+    if (FSE_isError(BIT_initCStream(&bitC, dst, dstSize))) {
+        return 0; // not enough space available to write a bitstream
+    }
+    FSE_initCState2(&s1, ct, *src);  src-=step;
+    FSE_initCState2(&s0, ct, *src);  src-=step;
+    BIT_flushBits(&bitC);
+    for (loop_times--; loop_times>0; loop_times--) {
+        FSE_encodeSymbol(&bitC, &s1, *src);  src-=step;
+        FSE_encodeSymbol(&bitC, &s0, *src);  src-=step;
+        BIT_flushBits(&bitC);
+    }
+    FSE_flushCState(&bitC, &s1);
+    FSE_flushCState(&bitC, &s0);
+    return BIT_closeCStream(&bitC);
+}
+
+
+
+static size_t FSE_compress_stream8_interleave2 (void* dst, size_t dstSize, const void* src, size_t srcSize, const FSE_CTable* ct) {
+    size_t srcSize_x16 = srcSize / 16;
+    size_t srcSize_rem = srcSize - srcSize_x16 * 16;
+
+    uint8_t *p_src     = (uint8_t*)src;
+    uint8_t *p_src_end = p_src + srcSize;
+    uint8_t *p_dst     = (uint8_t*)dst;
+    uint8_t *p_dst_end = p_dst + dstSize;
+
+    // write remain ----------------------
+    *(p_dst++) = srcSize_rem;
+    if (srcSize_rem > 0) {
+        memcpy(p_dst, p_src, srcSize_rem);
+        p_src += srcSize_rem;
+        p_dst += srcSize_rem;
+    }
+
+    // write x16 ----------------------
+    uint32_t *p_len = (uint32_t*)p_dst;
+    if (srcSize_x16 > 0) {
+        p_dst = (uint8_t*)(&(p_len[8]));
+        p_dst += p_len[0] = FSE_compress_interleave2(p_dst, (p_dst_end-p_dst), p_src_end-8, srcSize_x16, 8, ct);
+        p_dst += p_len[1] = FSE_compress_interleave2(p_dst, (p_dst_end-p_dst), p_src_end-7, srcSize_x16, 8, ct);
+        p_dst += p_len[2] = FSE_compress_interleave2(p_dst, (p_dst_end-p_dst), p_src_end-6, srcSize_x16, 8, ct);
+        p_dst += p_len[3] = FSE_compress_interleave2(p_dst, (p_dst_end-p_dst), p_src_end-5, srcSize_x16, 8, ct);
+        p_dst += p_len[4] = FSE_compress_interleave2(p_dst, (p_dst_end-p_dst), p_src_end-4, srcSize_x16, 8, ct);
+        p_dst += p_len[5] = FSE_compress_interleave2(p_dst, (p_dst_end-p_dst), p_src_end-3, srcSize_x16, 8, ct);
+        p_dst += p_len[6] = FSE_compress_interleave2(p_dst, (p_dst_end-p_dst), p_src_end-2, srcSize_x16, 8, ct);
+        p_dst += p_len[7] = FSE_compress_interleave2(p_dst, (p_dst_end-p_dst), p_src_end-1, srcSize_x16, 8, ct);
+    } else {
+        p_dst = (uint8_t*)(&(p_len[1]));
+        p_len[0] = 0;
+    }
+
+    return p_dst - (uint8_t*)dst;
+}
+
+
+
 size_t FSE_compress_usingCTable (void* dst, size_t dstSize,
                            const void* src, size_t srcSize,
                            const FSE_CTable* ct)
 {
+#ifdef __AVX2__
+    return FSE_compress_stream8_interleave2(dst, dstSize, src, srcSize, ct);
+#else
     unsigned const fast = (dstSize >= FSE_BLOCKBOUND(srcSize));
-
     if (fast)
         return FSE_compress_usingCTable_generic(dst, dstSize, src, srcSize, ct, 1);
     else
         return FSE_compress_usingCTable_generic(dst, dstSize, src, srcSize, ct, 0);
+#endif
 }
 
 
